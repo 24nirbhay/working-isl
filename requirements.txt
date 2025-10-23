@@ -1,0 +1,22 @@
+# Core libraries
+numpy==1.26.4
+pandas==2.2.3
+scikit-learn==1.5.2
+matplotlib==3.9.3
+
+# Deep learning
+tensorflow==2.17.0
+keras==3.5.0
+
+# Computer vision
+opencv-python==4.10.0.84
+
+# Hand tracking and landmark detection
+mediapipe==0.10.20
+
+# Resolve protobuf conflicts — Mediapipe requires <5.0
+protobuf>=4.25.3
+
+# Utilities
+joblib==1.4.2
+
