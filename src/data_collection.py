@@ -1,5 +1,6 @@
 import cv2
 import mediapipe as mp
+import numpy as np
 import csv
 import os
 import glob
@@ -13,6 +14,7 @@ DATA_PATH = "data/dataset"
 def _extract_two_hand_landmarks_from_results(results):
     """Return a flattened vector of length 126 (2 hands x 21 landmarks x 3 coords)
     Order: [Left(21*3), Right(21*3)]. If a hand is missing, its block is zeros.
+    Uses raw coordinates (no normalization) to match real-time translator.
     """
     # initialize zeros for left and right
     single_hand_len = 21 * 3
@@ -29,9 +31,10 @@ def _extract_two_hand_landmarks_from_results(results):
             label = handedness.classification[0].label  # 'Left' or 'Right'
         except Exception:
             label = None
-
+        
         landmarks = []
         for lm in hand_landmarks.landmark:
+            # Use raw coordinates (matching real-time translator)
             landmarks.extend([lm.x, lm.y, lm.z])
 
         if label == 'Left':
@@ -50,8 +53,7 @@ def _extract_two_hand_landmarks_from_results(results):
 
 def collect_data(gesture_name, num_samples=30, sequence_length=30):
     """Collect sequences from webcam using SPACE to start/stop recording.
-    Each sequence is saved as a CSV with sequence_length rows of 126 floats.
-    Press SPACE to start recording, SPACE again to save and move to next sequence.
+    Continuously captures frames while recording. Press SPACE to start, SPACE again to save.
     Press Q to quit.
     """
     cap = cv2.VideoCapture(0)
@@ -65,10 +67,10 @@ def collect_data(gesture_name, num_samples=30, sequence_length=30):
     
     print(f"\n{'='*60}")
     print(f"Collecting data for gesture: {gesture_name}")
-    print(f"Target: {num_samples} sequences of {sequence_length} frames each")
+    print(f"Target: {num_samples} sequences (continuous seamless capture)")
     print(f"{'='*60}")
     print("\nControls:")
-    print("  SPACE - Start/Stop recording a sequence")
+    print("  SPACE - Start recording / Stop and save sequence")
     print("  Q     - Quit collection")
     print(f"\nCollected: 0/{num_samples}")
     print("Ready... Press SPACE to start recording first sequence")
@@ -82,45 +84,53 @@ def collect_data(gesture_name, num_samples=30, sequence_length=30):
         frame = cv2.flip(frame, 1)
         img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = hands.process(img_rgb)
+        h, w = frame.shape[:2]
 
         # Draw hand landmarks
+        hands_detected = False
+        hand_confidence = 0.0
         if results and results.multi_hand_landmarks:
+            hands_detected = True
             for hand_landmarks in results.multi_hand_landmarks:
                 mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+            
+            # Get hand detection confidence
+            if results.multi_handedness:
+                for handedness in results.multi_handedness:
+                    try:
+                        score = handedness.classification[0].score
+                        hand_confidence = max(hand_confidence, score)
+                    except Exception:
+                        pass
 
-        # Show recording status
-        if recording:
-            status_text = f"RECORDING... {len(sequence)}/{sequence_length}"
-            status_color = (0, 0, 255)  # Red
-            cv2.circle(frame, (30, 30), 15, (0, 0, 255), -1)  # Red dot
+        # Show hand detection indicator (top-left corner) - smaller
+        if hands_detected:
+            cv2.circle(frame, (20, 20), 8, (0, 255, 0), -1)  # Green dot
         else:
-            status_text = f"Ready - Press SPACE to record ({collected_count}/{num_samples})"
-            status_color = (0, 255, 0)  # Green
-            cv2.circle(frame, (30, 30), 15, (0, 255, 0), -1)  # Green dot
+            cv2.circle(frame, (20, 20), 8, (0, 0, 255), -1)  # Red dot
         
-        cv2.putText(frame, status_text, (60, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
-        cv2.putText(frame, "Q - Quit", (10, frame.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        # Show instructions at top-left (5px font)
+        instructions = "SPACE - Start/Stop | Q - Quit"
+        cv2.putText(frame, instructions, (10, h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+        
+        # Show hand detection confidence at top-right (8px font)
+        confidence_text = f"Hand: {hand_confidence:.2f}"
+        cv2.putText(frame, confidence_text, (w - 120, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        
+        # Show status next to dot
+        if recording:
+            status_text = f"RECORDING... {len(sequence)} frames"
+            status_color = (0, 0, 255)  # Red
+        else:
+            status_text = f"Ready ({collected_count}/{num_samples} collected)"
+            status_color = (0, 255, 0)  # Green
+        
+        cv2.putText(frame, status_text, (40, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
 
-        # If recording, collect landmarks
+        # If recording, continuously collect landmarks
         if recording:
             landmarks = _extract_two_hand_landmarks_from_results(results)
             sequence.append(landmarks)
-            
-            # Auto-save when sequence is full
-            if len(sequence) >= sequence_length:
-                file_path = os.path.join(DATA_PATH, gesture_name, f"sequence_{collected_count}.csv")
-                with open(file_path, mode='w', newline='') as f:
-                    csv.writer(f).writerows(sequence)
-                
-                collected_count += 1
-                print(f"✓ Saved sequence {collected_count}/{num_samples}")
-                
-                # Reset for next sequence
-                sequence = []
-                recording = False
-                
-                if collected_count < num_samples:
-                    print(f"Press SPACE to record next sequence ({collected_count}/{num_samples})")
 
         cv2.imshow("Collecting Data", frame)
         
@@ -133,10 +143,23 @@ def collect_data(gesture_name, num_samples=30, sequence_length=30):
                 # Start recording
                 recording = True
                 sequence = []
-                print(f"\nRecording sequence {collected_count + 1}...")
+                print(f"\n● Recording sequence {collected_count + 1}... (Press SPACE to stop)")
             else:
-                # Stop recording early (user wants to restart)
-                print(f"Recording stopped (only {len(sequence)} frames). Press SPACE to start again.")
+                # Stop recording and save
+                if len(sequence) >= 5:  # Minimum 5 frames
+                    file_path = os.path.join(DATA_PATH, gesture_name, f"sequence_{collected_count}.csv")
+                    with open(file_path, mode='w', newline='', encoding='utf-8') as f:
+                        csv.writer(f).writerows(sequence)
+                    
+                    collected_count += 1
+                    print(f"✓ Saved sequence {collected_count}/{num_samples} ({len(sequence)} frames)")
+                    
+                    if collected_count < num_samples:
+                        print(f"Press SPACE to record next sequence")
+                else:
+                    print(f"✗ Sequence too short ({len(sequence)} frames). Need at least 5 frames.")
+                
+                # Reset for next sequence
                 sequence = []
                 recording = False
 
@@ -147,6 +170,104 @@ def collect_data(gesture_name, num_samples=30, sequence_length=30):
     print(f"\n{'='*60}")
     print(f"Collection complete: {collected_count}/{num_samples} sequences saved")
     print(f"Location: {os.path.join(DATA_PATH, gesture_name)}")
+    print(f"{'='*60}\n")
+
+
+def convert_images_to_sequences(images_root="data/handsigns", output_root=DATA_PATH, frames_per_sequence=30):
+    """Convert existing hand-sign images into sequences for training.
+    
+    Takes images from images_root/<gesture>/*.{jpg,png} and creates sequences by:
+    1. Processing each image to extract landmarks
+    2. Grouping images into sequences of specified length
+    3. Saving as CSV files in output_root/<gesture>/sequence_*.csv
+    
+    Args:
+        images_root: Path to directory containing gesture subdirectories with images
+        output_root: Path to save generated sequence CSVs
+        frames_per_sequence: Number of images to group into each sequence
+    """
+    if not os.path.exists(images_root):
+        print(f"Error: Images directory not found: {images_root}")
+        return
+    
+    os.makedirs(output_root, exist_ok=True)
+    total_sequences = 0
+    total_failed = 0
+    
+    print(f"\n{'='*60}")
+    print(f"Converting images to sequences")
+    print(f"Source: {images_root}")
+    print(f"Output: {output_root}")
+    print(f"Frames per sequence: {frames_per_sequence}")
+    print(f"{'='*60}\n")
+    
+    for gesture_name in sorted(os.listdir(images_root)):
+        gesture_dir = os.path.join(images_root, gesture_name)
+        if not os.path.isdir(gesture_dir):
+            continue
+        
+        # Get all image files
+        image_files = sorted(
+            glob.glob(os.path.join(gesture_dir, "*.jpg")) + 
+            glob.glob(os.path.join(gesture_dir, "*.png"))
+        )
+        
+        if not image_files:
+            print(f"No images found for gesture '{gesture_name}'")
+            continue
+        
+        print(f"\nProcessing gesture '{gesture_name}': {len(image_files)} images")
+        
+        # Create output directory
+        output_dir = os.path.join(output_root, gesture_name)
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Process images and extract landmarks
+        landmarks_list = []
+        for img_path in image_files:
+            landmarks = extract_landmarks_from_image_file(img_path, debug=False)
+            if landmarks is not None and sum(abs(x) for x in landmarks) > 0:  # Valid landmarks
+                landmarks_list.append(landmarks)
+            else:
+                total_failed += 1
+        
+        if not landmarks_list:
+            print(f"  ✗ No valid landmarks extracted for gesture '{gesture_name}'")
+            continue
+        
+        print(f"  ✓ Extracted landmarks from {len(landmarks_list)} images")
+        
+        # Group into sequences
+        num_sequences = len(landmarks_list) // frames_per_sequence
+        if num_sequences == 0:
+            # If we don't have enough for a full sequence, create one by repeating
+            sequence = landmarks_list * (frames_per_sequence // len(landmarks_list) + 1)
+            sequence = sequence[:frames_per_sequence]
+            
+            file_path = os.path.join(output_dir, "sequence_0.csv")
+            with open(file_path, mode='w', newline='', encoding='utf-8') as f:
+                csv.writer(f).writerows(sequence)
+            total_sequences += 1
+            print(f"  ✓ Created 1 sequence (repeated {len(landmarks_list)} landmarks to fill)")
+        else:
+            # Create multiple sequences
+            for seq_idx in range(num_sequences):
+                start_idx = seq_idx * frames_per_sequence
+                end_idx = start_idx + frames_per_sequence
+                sequence = landmarks_list[start_idx:end_idx]
+                
+                file_path = os.path.join(output_dir, f"sequence_{seq_idx}.csv")
+                with open(file_path, mode='w', newline='', encoding='utf-8') as f:
+                    csv.writer(f).writerows(sequence)
+                total_sequences += 1
+            
+            remaining = len(landmarks_list) % frames_per_sequence
+            print(f"  ✓ Created {num_sequences} sequences ({remaining} images unused)")
+    
+    print(f"\n{'='*60}")
+    print(f"Conversion complete!")
+    print(f"Total sequences created: {total_sequences}")
+    print(f"Failed image extractions: {total_failed}")
     print(f"{'='*60}\n")
 
 
@@ -193,6 +314,61 @@ def extract_landmarks_from_image_file(image_path, debug=False):
     
     hands.close()
     return landmarks
+
+
+def split_large_sequence(gesture_name, sequence_file, target_length=30, overlap=10):
+    """Split a large sequence file into multiple smaller sequences.
+    
+    Args:
+        gesture_name: Name of the gesture
+        sequence_file: Path to the large sequence CSV file
+        target_length: Target length for each split sequence (default: 30)
+        overlap: Number of overlapping frames between sequences (default: 10)
+    """
+    import pandas as pd
+    
+    gesture_dir = os.path.join(DATA_PATH, gesture_name)
+    
+    # Read the large sequence
+    df = pd.read_csv(sequence_file, header=None)
+    total_frames = len(df)
+    
+    print(f"\nSplitting {sequence_file}")
+    print(f"Total frames: {total_frames}")
+    
+    # Calculate number of sequences we can create
+    stride = target_length - overlap
+    num_sequences = max(1, (total_frames - target_length) // stride + 1)
+    
+    print(f"Will create {num_sequences} sequences of ~{target_length} frames each")
+    
+    # Get existing sequence numbers
+    existing_files = glob.glob(os.path.join(gesture_dir, "sequence_*.csv"))
+    if existing_files:
+        existing_nums = [int(os.path.basename(f).replace("sequence_", "").replace(".csv", "")) 
+                        for f in existing_files]
+        start_num = max(existing_nums) + 1
+    else:
+        start_num = 0
+    
+    # Split into sequences
+    sequences_created = 0
+    for i in range(num_sequences):
+        start_idx = i * stride
+        end_idx = min(start_idx + target_length, total_frames)
+        
+        if end_idx - start_idx < 10:  # Skip very short sequences
+            continue
+        
+        sequence_data = df.iloc[start_idx:end_idx]
+        
+        output_file = os.path.join(gesture_dir, f"sequence_{start_num + sequences_created}.csv")
+        sequence_data.to_csv(output_file, header=False, index=False)
+        sequences_created += 1
+        print(f"  Created sequence_{start_num + sequences_created - 1}.csv ({len(sequence_data)} frames)")
+    
+    print(f"\n✓ Created {sequences_created} sequences from {total_frames} frames")
+    return sequences_created
 
 
 def process_image_dataset(src_root, dst_root=DATA_PATH):

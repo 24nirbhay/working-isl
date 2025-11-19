@@ -1,41 +1,77 @@
 import tensorflow as tf
 from tensorflow.keras import layers
 
+
+class ReduceSumLayer(layers.Layer):
+    """Custom layer to sum across time dimension. Replaces Lambda for serialization."""
+    
+    def __init__(self, axis=1, **kwargs):
+        super(ReduceSumLayer, self).__init__(**kwargs)
+        self.axis = axis
+    
+    def call(self, inputs):
+        return tf.reduce_sum(inputs, axis=self.axis)
+    
+    def get_config(self):
+        config = super(ReduceSumLayer, self).get_config()
+        config.update({'axis': self.axis})
+        return config
+
+
 def create_sign_language_model(time_steps, feature_dim, num_classes):
-    """Create a more sophisticated model architecture for sign language recognition.
+    """Create a sophisticated model architecture for sign language recognition.
+    
+    This architecture is designed to learn temporal patterns in hand gestures:
+    - Masking layer handles variable-length sequences (padded data)
+    - Bidirectional LSTMs learn forward and backward temporal patterns
+    - Attention mechanism focuses on important frames
+    - Dense layers map learned patterns to gesture classes
     
     Args:
-        time_steps: Number of time steps in the sequence
-        feature_dim: Number of features per time step (126 for hand landmarks)
-        num_classes: Number of output classes
+        time_steps: Number of time steps in the sequence (30 frames)
+        feature_dim: Number of features per time step (126 for both hands)
+        num_classes: Number of output classes (gestures)
         
     Returns:
         Compiled Keras model
     """
-    # Input and masking
+    # Input and masking for variable-length sequences
     inputs = layers.Input(shape=(time_steps, feature_dim))
     x = layers.Masking(mask_value=0.)(inputs)
     
-    # Batch normalization for input
+    # Batch normalization on input
     x = layers.BatchNormalization()(x)
     
-    # Bidirectional LSTM layers
-    x = layers.Bidirectional(layers.LSTM(256, return_sequences=True))(x)
-    x = layers.Dropout(0.4)(x)
+    # First Bidirectional LSTM layer - learns basic temporal patterns
+    x = layers.Bidirectional(
+        layers.LSTM(128, return_sequences=True, dropout=0.3, recurrent_dropout=0.2)
+    )(x)
     x = layers.BatchNormalization()(x)
     
-    x = layers.Bidirectional(layers.LSTM(128))(x)
-    x = layers.Dropout(0.4)(x)
+    # Second Bidirectional LSTM layer - learns complex gesture patterns  
+    lstm_out = layers.Bidirectional(
+        layers.LSTM(64, return_sequences=True, dropout=0.3, recurrent_dropout=0.2)
+    )(x)
+    x = layers.BatchNormalization()(lstm_out)
+    
+    # Attention mechanism - focuses on important frames in the gesture
+    attention = layers.Dense(1, activation='tanh')(x)
+    attention = layers.Flatten()(attention)
+    attention = layers.Activation('softmax')(attention)
+    attention = layers.RepeatVector(128)(attention)  # 64*2 from Bidirectional
+    attention = layers.Permute([2, 1])(attention)
+    
+    # Apply attention weights
+    x = layers.Multiply()([lstm_out, attention])
+    x = ReduceSumLayer(axis=1)(x)
+    
+    # Dense layers for classification
+    x = layers.Dense(128, activation='relu', kernel_regularizer=tf.keras.regularizers.l2(0.01))(x)
+    x = layers.Dropout(0.5)(x)
     x = layers.BatchNormalization()(x)
     
-    # Dense layers with residual connections
-    dense1 = layers.Dense(256, activation='relu')(x)
-    x = layers.Dropout(0.4)(dense1)
-    x = layers.BatchNormalization()(x)
-    
-    dense2 = layers.Dense(128, activation='relu')(x)
-    x = layers.Concatenate()([dense1, dense2])  # Skip connection
-    x = layers.Dropout(0.4)(x)
+    x = layers.Dense(64, activation='relu', kernel_regularizer=tf.keras.regularizers.l2(0.01))(x)
+    x = layers.Dropout(0.5)(x)
     x = layers.BatchNormalization()(x)
     
     # Output layer
@@ -44,11 +80,11 @@ def create_sign_language_model(time_steps, feature_dim, num_classes):
     model = tf.keras.Model(inputs, outputs)
     
     # Compile with learning rate schedule
-    initial_learning_rate = 0.001
+    initial_learning_rate = 0.0005
     lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
         initial_learning_rate,
-        decay_steps=1000,
-        decay_rate=0.9,
+        decay_steps=500,
+        decay_rate=0.95,
         staircase=True)
     
     optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)

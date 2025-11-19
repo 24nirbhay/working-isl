@@ -2,262 +2,284 @@ import cv2
 import mediapipe as mp
 import numpy as np
 import tensorflow as tf
-from joblib import load
-from collections import deque
-import time
+import tensorflow.keras as keras
+from src.model_architecture import ReduceSumLayer
+import glob
 import os
+import joblib
 
-class SignLanguageTranslator:
-    def __init__(self, model_dir="models", gesture_threshold=0.4, pause_threshold=2.0):
-        """Initialize the translator with models and parameters.
+mp_hands = mp.solutions.hands
+mp_drawing = mp.solutions.drawing_utils
+
+
+class RealTimeTranslator:
+    def __init__(self, model_path, max_sequence_length=30):
+        """Initialize the real-time translator.
         
         Args:
-            model_dir: Directory containing the model files
-            gesture_threshold: Confidence threshold for gesture recognition
-            pause_threshold: Time in seconds to wait before considering a sentence complete
+            model_path: Path to the trained model directory
+            max_sequence_length: Maximum sequence length for padding
         """
-        # Load the latest model if model_dir is a directory
-        if os.path.isdir(model_dir):
-            model_dirs = [d for d in os.listdir(model_dir) if d.startswith('model_')]
-            if model_dirs:
-                latest_model = max(model_dirs)
-                model_dir = os.path.join(model_dir, latest_model)
+        self.max_sequence_length = max_sequence_length
+        self.current_sequence = []
+        self.sentence = []
+        self.current_confidence = 0.0  # Track current prediction confidence
         
-        self.model = tf.keras.models.load_model(os.path.join(model_dir, "model.keras"))
-        self.le = load(os.path.join(model_dir, "label_encoder.joblib"))
+        # Load model with custom objects
+        model_file = os.path.join(model_path, 'model.keras')
+        self.model = keras.models.load_model(model_file, custom_objects={'ReduceSumLayer': ReduceSumLayer})
         
-        # MediaPipe setup
-        self.mp_hands = mp.solutions.hands
-        self.hands = self.mp_hands.Hands(
-            static_image_mode=False,
-            max_num_hands=2,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5
-        )
-        self.mp_drawing = mp.solutions.drawing_utils
+        # Load label encoder
+        label_encoder_file = os.path.join(model_path, 'label_encoder.joblib')
+        self.label_encoder = joblib.load(label_encoder_file)
         
-        # Parameters
-        self.sequence_length = 30
-        self.gesture_threshold = gesture_threshold
-        self.pause_threshold = pause_threshold
-        
-        # State variables
-        self.sequence = deque(maxlen=self.sequence_length)
-        self.current_sentence = []
-        self.last_gesture_time = time.time()
+        # Detection parameters
+        self.threshold = 0.6  # Confidence threshold
+        self.min_consecutive_frames = 5  # Frames needed for detection
+        self.consecutive_count = 0
         self.last_prediction = None
-        self.consecutive_frames = 0
+        self.gesture_cooldown = 0  # Cooldown to prevent duplicate detections
+        self.cooldown_frames = 15  # Number of frames to wait
         
-        # Sentence finalization
-        self.sentence_finalized = False
-        self.finalized_time = 0
-        self.finalized_text = ""
-        self.output_file = "../isl_to_english.txt"
-        
+        print(f"Model loaded from {model_path}")
+        print(f"Gestures: {list(self.label_encoder.classes_)}")
+        print("\nControls:")
+        print("  SPACE - Finalize and save sentence")
+        print("  C - Clear current sentence")
+        print("  Q - Quit")
+        print("\nContinuous gesture detection active...")
+    
     def _extract_hand_landmarks(self, results):
-        """Extract hand landmarks in the correct format."""
+        """Extract hand landmarks from MediaPipe results.
+        Returns a flattened vector of length 126 (2 hands x 21 landmarks x 3 coords).
+        Uses raw coordinates (matching data collection).
+        """
         single_hand_len = 21 * 3
         left = [0.0] * single_hand_len
         right = [0.0] * single_hand_len
 
-        if not results.multi_hand_landmarks:
+        if not results or not results.multi_hand_landmarks:
             return left + right
 
-        for hand_landmarks, handedness in zip(results.multi_hand_landmarks, 
-                                           results.multi_handedness):
+        for hand_landmarks, handedness in zip(results.multi_hand_landmarks, getattr(results, 'multi_handedness', [])):
+            label = None
+            try:
+                label = handedness.classification[0].label
+            except Exception:
+                label = None
+            
             landmarks = []
             for lm in hand_landmarks.landmark:
+                # Use raw coordinates (matching data collection)
                 landmarks.extend([lm.x, lm.y, lm.z])
 
-            if handedness.classification[0].label == 'Left':
+            if label == 'Left':
                 left = landmarks
-            else:
+            elif label == 'Right':
                 right = landmarks
+            else:
+                if sum(left) == 0:
+                    left = landmarks
+                else:
+                    right = landmarks
 
         return left + right
     
-    def _predict_gesture(self):
-        """Predict the current gesture from the sequence."""
-        if len(self.sequence) < self.sequence_length:
+    def _predict_gesture(self, sequence):
+        """Predict gesture from sequence of landmarks."""
+        if len(sequence) == 0:
             return None, 0.0
-            
-        X = np.array([list(self.sequence)], dtype='float32')
-        preds = self.model.predict(X, verbose=0)[0]
-        idx = np.argmax(preds)
-        confidence = preds[idx]
-        predicted_class = self.le.inverse_transform([idx])[0]
         
-        # Debug: Show all predictions above 0.2
-        if confidence > 0.2:
-            print(f"\rDetected: {predicted_class} ({confidence*100:.1f}%) | Seq: {len(self.sequence)}/{self.sequence_length}", end='', flush=True)
+        # Pad sequence to max length
+        padded = np.zeros((self.max_sequence_length, 126))
+        seq_len = min(len(sequence), self.max_sequence_length)
+        padded[:seq_len] = sequence[-seq_len:]
         
-        if confidence >= self.gesture_threshold:
-            return predicted_class, confidence
+        # Predict
+        input_data = np.expand_dims(padded, axis=0)
+        predictions = self.model.predict(input_data, verbose=0)
+        
+        predicted_idx = np.argmax(predictions[0])
+        confidence = predictions[0][predicted_idx]
+        
+        if confidence >= self.threshold:
+            gesture = self.label_encoder.inverse_transform([predicted_idx])[0]
+            return gesture, confidence
+        
         return None, confidence
     
-    def process_frame(self, frame):
-        """Process a single frame and update the state."""
-        # Flip frame horizontally for a later selfie-view display
-        frame = cv2.flip(frame, 1)
+    def process_frame(self, frame, results):
+        """Process a single frame and update detection state.
         
-        # Convert the BGR image to RGB
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = self.hands.process(rgb_frame)
-        
-        # Extract landmarks and add to sequence continuously
-        landmarks = self._extract_hand_landmarks(results)
-        self.sequence.append(landmarks)
-        
-        # Draw hand landmarks
-        if results.multi_hand_landmarks:
-            for hand_landmarks in results.multi_hand_landmarks:
-                self.mp_drawing.draw_landmarks(
-                    frame, hand_landmarks, self.mp_hands.HAND_CONNECTIONS)
-        
-        # Predict gesture continuously
-        gesture, confidence = self._predict_gesture()
-        
-        # Update state continuously
-        current_time = time.time()
-        if gesture:
-            if gesture != self.last_prediction:
-                self.consecutive_frames = 1
-            else:
-                self.consecutive_frames += 1
-                
-            if self.consecutive_frames >= 5:  # Require 5 consecutive same predictions
-                if not self.current_sentence or self.current_sentence[-1] != gesture:
-                    self.current_sentence.append(gesture)
-                    self.last_gesture_time = current_time
-                
-            self.last_prediction = gesture
-        
-        # Check if finalized sentence should be cleared (after 3 seconds)
-        if self.sentence_finalized and (current_time - self.finalized_time) >= 3.0:
-            self.sentence_finalized = False
-            self.finalized_text = ""
+        Args:
+            frame: The current video frame
+            results: MediaPipe hand detection results
             
+        Returns:
+            frame: The annotated frame
+        """
+        # Extract landmarks
+        landmarks = self._extract_hand_landmarks(results)
+        
+        # Draw hand landmarks with MediaPipe style (connections and all)
+        if results and results.multi_hand_landmarks:
+            for hand_landmarks in results.multi_hand_landmarks:
+                mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+        
+        # Add to sequence if hands detected
+        if sum(landmarks) != 0:
+            self.current_sequence.append(landmarks)
+            # Keep only recent frames for continuous detection
+            if len(self.current_sequence) > self.max_sequence_length:
+                self.current_sequence.pop(0)
+        
+        # Decrement cooldown
+        if self.gesture_cooldown > 0:
+            self.gesture_cooldown -= 1
+        
+        # Continuous prediction if we have enough frames and no cooldown
+        if len(self.current_sequence) >= 5 and self.gesture_cooldown == 0:
+            gesture, confidence = self._predict_gesture(self.current_sequence)
+            self.current_confidence = confidence  # Store for UI display
+            
+            if gesture:
+                if gesture == self.last_prediction:
+                    self.consecutive_count += 1
+                else:
+                    self.consecutive_count = 1
+                    self.last_prediction = gesture
+                
+                # Add to sentence if we have enough consecutive detections
+                if self.consecutive_count >= self.min_consecutive_frames:
+                    self.sentence.append(gesture)
+                    self.current_sequence = []
+                    self.consecutive_count = 0
+                    self.last_prediction = None
+                    self.gesture_cooldown = self.cooldown_frames  # Start cooldown
+                    print(f"  Detected: {gesture} ({confidence:.2f})")
+            else:
+                self.consecutive_count = 0
+                self.last_prediction = None
+        else:
+            # Reset confidence when not actively predicting
+            if len(self.current_sequence) < 5:
+                self.current_confidence = 0.0
+        
         # Draw UI
-        self._draw_ui(frame, gesture, confidence, current_time)
+        self._draw_ui(frame, results)
         
-        return frame, current_time
+        return frame
     
-    def _draw_ui(self, frame, gesture, confidence, current_time):
-        """Draw the UI elements on the frame."""
-        # Show hand detection status as green dot
-        hands_detected = len(self.sequence) > 0 and np.sum(self.sequence[-1]) > 0
-        dot_color = (0, 255, 0) if hands_detected else (0, 0, 255)
-        cv2.circle(frame, (frame.shape[1] - 30, 30), 15, dot_color, -1)
+    def _draw_ui(self, frame, results):
+        """Draw UI elements on the frame."""
+        h, w, _ = frame.shape
         
-        # Draw current sentence at bottom
-        if self.current_sentence:
-            sentence = " ".join(self.current_sentence)
-            cv2.putText(frame, sentence, (10, frame.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+        # Top-left controls (smaller font - 5px)
+        controls_text = "SPACE: Save | C: Clear | Q: Quit"
+        cv2.putText(frame, controls_text, (10, 20), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
         
-        # Draw finalized sentence (green, will disappear after 3 seconds)
-        if self.sentence_finalized:
-            time_remaining = 3.0 - (current_time - self.finalized_time)
-            cv2.putText(frame, f"SAVED: {self.finalized_text}", (10, frame.shape[0] - 60), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
-            cv2.putText(frame, f"Clearing in {time_remaining:.1f}s", (10, frame.shape[0] - 100), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-    
-    def get_current_sentence(self):
-        """Get the current sentence and reset if completed."""
-        if not self.current_sentence:
-            return ""
+        # Top-right: Hand detection confidence (8px font)
+        hand_confidence = 0.0
+        if results and results.multi_hand_landmarks and results.multi_handedness:
+            # Get the highest confidence from detected hands
+            for handedness in results.multi_handedness:
+                try:
+                    score = handedness.classification[0].score
+                    hand_confidence = max(hand_confidence, score)
+                except Exception:
+                    pass
         
-        sentence = " ".join(self.current_sentence)
-        self.current_sentence = []
-        self.last_prediction = None
-        self.consecutive_frames = 0
-        return sentence
+        confidence_text = f"Hand: {hand_confidence:.2f}"
+        cv2.putText(frame, confidence_text, (w - 120, 20), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        
+        # Show prediction confidence if available
+        if self.current_confidence > 0.0:
+            pred_text = f"Pred: {self.current_confidence:.2f}"
+            cv2.putText(frame, pred_text, (w - 120, 45), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        
+        # Current sentence (bottom) - display directly without "Sentence:" prefix
+        sentence_text = " ".join(self.sentence) if self.sentence else ""
+        if sentence_text:
+            cv2.putText(frame, sentence_text, (10, h - 20),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
     
     def finalize_sentence(self):
-        """Finalize and save the current sentence."""
-        if not self.current_sentence:
-            return None
-        
-        sentence = self.get_current_sentence()
-        if sentence:
-            self.finalized_text = sentence
-            self.sentence_finalized = True
-            self.finalized_time = time.time()
-            self.save_to_output_file(sentence)
-            return sentence
-        return None
+        """Save and clear the current sentence."""
+        if self.sentence:
+            sentence_text = " ".join(self.sentence)
+            print(f"\n✓ Saved: {sentence_text}\n")
+            
+            # Save to file
+            with open("translations.txt", "a", encoding="utf-8") as f:
+                f.write(sentence_text + "\n")
+            
+            self.sentence = []
+            self.current_sequence = []
     
-    def save_to_output_file(self, sentence):
-        """Save the translated sentence to output file for English-to-Konkani model."""
-        try:
-            with open(self.output_file, 'a', encoding='utf-8') as f:
-                f.write(sentence + '\n')
-            print(f"Saved to {self.output_file}: {sentence}")
-        except Exception as e:
-            print(f"Error saving to file: {e}")
-    
-    def __del__(self):
-        """Clean up resources."""
-        self.hands.close()
+    def clear_sentence(self):
+        """Clear the current sentence without saving."""
+        self.sentence = []
+        self.current_sequence = []
+        self.consecutive_count = 0
+        self.last_prediction = None
+        print("\n✗ Sentence cleared\n")
+
 
 def main():
-    # Initialize camera
+    """Main function to run the real-time translator."""
+    # Find the most recent model
+    model_dirs = glob.glob("models/model_*")
+    if not model_dirs:
+        print("No trained model found. Please train a model first using: python app.py train")
+        return
+    
+    latest_model = max(model_dirs, key=os.path.getmtime)
+    print(f"Using model: {latest_model}")
+    
+    translator = RealTimeTranslator(latest_model)
+    
     cap = cv2.VideoCapture(0)
-    translator = SignLanguageTranslator()
+    cap.set(cv2.CAP_PROP_FPS, 60)
     
-    # Clear output file at start
-    try:
-        with open(translator.output_file, 'w', encoding='utf-8') as f:
-            f.write('')
-        print(f"Output file cleared: {translator.output_file}")
-    except Exception as e:
-        print(f"Warning: Could not clear output file: {e}")
-    
-    print("\n" + "="*60)
-    print("ISL to English Translator")
-    print("="*60)
-    print(f"Model loaded: {len(translator.le.classes_)} gestures")
-    print(f"Available gestures: {', '.join(sorted(translator.le.classes_))}")
-    print(f"Gesture threshold: {translator.gesture_threshold} (lowered for easier detection)")
-    print("="*60)
-    print("\nControls:")
-    print("  SPACE - Save current sentence and reset")
-    print("  q - Quit")
-    print("\nInstructions:")
-    print("  1. Make gestures - they appear in real-time")
-    print("  2. Hold gesture steady for best detection")
-    print("  3. Watch the buffer fill up (30 frames needed)")
-    print("  4. Press SPACE when you want to save the sentence")
-    print(f"\nOutput saved to: {translator.output_file}")
-    print("="*60 + "\n")
-    
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            print("Failed to grab frame")
-            break
+    with mp_hands.Hands(
+        static_image_mode=False,
+        max_num_hands=2,
+        min_detection_confidence=0.5,
+        min_tracking_confidence=0.5
+    ) as hands:
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
             
-        # Process frame
-        frame, current_time = translator.process_frame(frame)
-        
-        # Show frame
-        cv2.imshow('ISL to English Translator', frame)
-        
-        # Check for key presses
-        key = cv2.waitKey(1) & 0xFF
-        
-        if key == ord('q'):
-            break
-        elif key == ord(' '):
-            # Finalize and save current sentence
-            sentence = translator.finalize_sentence()
-            if sentence:
-                print(f"\n{'='*60}")
-                print(f"SAVED: {sentence}")
-                print(f"{'='*60}\n")
-            else:
-                print("\nNo sentence to save (make some gestures first)\n")
+            # Flip for mirror effect
+            frame = cv2.flip(frame, 1)
+            
+            # Process with MediaPipe
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            results = hands.process(rgb_frame)
+            
+            # Process frame
+            frame = translator.process_frame(frame, results)
+            
+            # Display
+            cv2.imshow('ISL to English Translator', frame)
+            
+            # Handle keyboard input
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                break
+            elif key == ord(' '):  # Space to finalize
+                translator.finalize_sentence()
+            elif key == ord('c'):  # C to clear
+                translator.clear_sentence()
     
     cap.release()
     cv2.destroyAllWindows()
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()

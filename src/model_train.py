@@ -66,8 +66,15 @@ def train_model(epochs=50, batch_size=32, validation_split=0.2):
     
     # Check for minimum samples per class
     min_samples = min(counts)
-    if min_samples < 5:
-        logging.warning(f"Some classes have very few samples (minimum: {min_samples}). Consider collecting more data.")
+    if min_samples < 2:
+        logging.error(f"Some classes have only {min_samples} sample(s). Need at least 2 samples per class for training.")
+        logging.error(f"Classes with insufficient samples:")
+        for label, count in class_distribution.items():
+            if count < 2:
+                logging.error(f"  - '{label}': {count} sample(s) (need at least 2)")
+        raise ValueError(f"Insufficient training data. Collect at least 2 sequences for each gesture.")
+    elif min_samples < 5:
+        logging.warning(f"Some classes have very few samples (minimum: {min_samples}). Recommend collecting at least 10 samples per gesture for better accuracy.")
   
     # Split dataset
     X_train, X_test, y_train, y_test = train_test_split(
@@ -145,7 +152,7 @@ def train_model(epochs=50, batch_size=32, validation_split=0.2):
     hist_df.to_csv(os.path.join(model_dir, 'training_history.csv'), index=False)
     
     # Save model summary to text file
-    with open(os.path.join(model_dir, 'model_summary.txt'), 'w') as f:
+    with open(os.path.join(model_dir, 'model_summary.txt'), 'w', encoding='utf-8') as f:
         model.summary(print_fn=lambda x: f.write(x + '\n'))
     
     logging.info(f"Training complete. Model and artifacts saved to {model_dir}")
