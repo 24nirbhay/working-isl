@@ -48,41 +48,106 @@ def _extract_two_hand_landmarks_from_results(results):
     return left + right
 
 
-def collect_data(gesture_name, num_samples=10, sequence_length=30):
-    """Collect sequences from webcam. Each sequence row is 126 floats (left+right).
-    Saves CSVs under data/dataset/<gesture_name>/sequence_*.csv with sequence_length rows each.
+def collect_data(gesture_name, num_samples=30, sequence_length=30):
+    """Collect sequences from webcam using SPACE to start/stop recording.
+    Each sequence is saved as a CSV with sequence_length rows of 126 floats.
+    Press SPACE to start recording, SPACE again to save and move to next sequence.
+    Press Q to quit.
     """
     cap = cv2.VideoCapture(0)
-    hands = mp_hands.Hands(max_num_hands=2)
+    cap.set(cv2.CAP_PROP_FPS, 60)  # Set to 60fps
+    hands = mp_hands.Hands(max_num_hands=2, min_detection_confidence=0.5, min_tracking_confidence=0.5)
     os.makedirs(os.path.join(DATA_PATH, gesture_name), exist_ok=True)
 
-    for i in range(num_samples):
-        sequence = []
-        while len(sequence) < sequence_length:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            frame = cv2.flip(frame, 1)
-            img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            results = hands.process(img_rgb)
+    collected_count = 0
+    recording = False
+    sequence = []
+    
+    print(f"\n{'='*60}")
+    print(f"Collecting data for gesture: {gesture_name}")
+    print(f"Target: {num_samples} sequences of {sequence_length} frames each")
+    print(f"{'='*60}")
+    print("\nControls:")
+    print("  SPACE - Start/Stop recording a sequence")
+    print("  Q     - Quit collection")
+    print(f"\nCollected: 0/{num_samples}")
+    print("Ready... Press SPACE to start recording first sequence")
+    print(f"{'='*60}\n")
 
+    while collected_count < num_samples:
+        ret, frame = cap.read()
+        if not ret:
+            break
+            
+        frame = cv2.flip(frame, 1)
+        img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = hands.process(img_rgb)
+
+        # Draw hand landmarks
+        if results and results.multi_hand_landmarks:
+            for hand_landmarks in results.multi_hand_landmarks:
+                mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+
+        # Show recording status
+        if recording:
+            status_text = f"RECORDING... {len(sequence)}/{sequence_length}"
+            status_color = (0, 0, 255)  # Red
+            cv2.circle(frame, (30, 30), 15, (0, 0, 255), -1)  # Red dot
+        else:
+            status_text = f"Ready - Press SPACE to record ({collected_count}/{num_samples})"
+            status_color = (0, 255, 0)  # Green
+            cv2.circle(frame, (30, 30), 15, (0, 255, 0), -1)  # Green dot
+        
+        cv2.putText(frame, status_text, (60, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
+        cv2.putText(frame, "Q - Quit", (10, frame.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+        # If recording, collect landmarks
+        if recording:
             landmarks = _extract_two_hand_landmarks_from_results(results)
             sequence.append(landmarks)
+            
+            # Auto-save when sequence is full
+            if len(sequence) >= sequence_length:
+                file_path = os.path.join(DATA_PATH, gesture_name, f"sequence_{collected_count}.csv")
+                with open(file_path, mode='w', newline='') as f:
+                    csv.writer(f).writerows(sequence)
+                
+                collected_count += 1
+                print(f"✓ Saved sequence {collected_count}/{num_samples}")
+                
+                # Reset for next sequence
+                sequence = []
+                recording = False
+                
+                if collected_count < num_samples:
+                    print(f"Press SPACE to record next sequence ({collected_count}/{num_samples})")
 
-            # draw whichever hands are present for feedback
-            if results and results.multi_hand_landmarks:
-                for hand_landmarks in results.multi_hand_landmarks:
-                    mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+        cv2.imshow("Collecting Data", frame)
+        
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
+            print("\nCollection cancelled by user")
+            break
+        elif key == ord(' '):  # Spacebar
+            if not recording:
+                # Start recording
+                recording = True
+                sequence = []
+                print(f"\nRecording sequence {collected_count + 1}...")
+            else:
+                # Stop recording early (user wants to restart)
+                print(f"Recording stopped (only {len(sequence)} frames). Press SPACE to start again.")
+                sequence = []
+                recording = False
 
-            cv2.imshow("Collecting Data", frame)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                cap.release()
-                cv2.destroyAllWindows()
-                return
-
-        file_path = os.path.join(DATA_PATH, gesture_name, f"sequence_{i}.csv")
-        with open(file_path, mode='w', newline='') as f:
-            csv.writer(f).writerows(sequence)
+    cap.release()
+    cv2.destroyAllWindows()
+    hands.close()
+    
+    print(f"\n{'='*60}")
+    print(f"Collection complete: {collected_count}/{num_samples} sequences saved")
+    print(f"Location: {os.path.join(DATA_PATH, gesture_name)}")
+    print(f"{'='*60}\n")
 
 
 def extract_landmarks_from_image_file(image_path, debug=False):

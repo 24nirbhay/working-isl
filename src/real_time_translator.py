@@ -8,7 +8,7 @@ import time
 import os
 
 class SignLanguageTranslator:
-    def __init__(self, model_dir="models", gesture_threshold=0.6, pause_threshold=2.0):
+    def __init__(self, model_dir="models", gesture_threshold=0.4, pause_threshold=2.0):
         """Initialize the translator with models and parameters.
         
         Args:
@@ -48,6 +48,12 @@ class SignLanguageTranslator:
         self.last_prediction = None
         self.consecutive_frames = 0
         
+        # Sentence finalization
+        self.sentence_finalized = False
+        self.finalized_time = 0
+        self.finalized_text = ""
+        self.output_file = "../isl_to_english.txt"
+        
     def _extract_hand_landmarks(self, results):
         """Extract hand landmarks in the correct format."""
         single_hand_len = 21 * 3
@@ -79,9 +85,14 @@ class SignLanguageTranslator:
         preds = self.model.predict(X, verbose=0)[0]
         idx = np.argmax(preds)
         confidence = preds[idx]
+        predicted_class = self.le.inverse_transform([idx])[0]
+        
+        # Debug: Show all predictions above 0.2
+        if confidence > 0.2:
+            print(f"\rDetected: {predicted_class} ({confidence*100:.1f}%) | Seq: {len(self.sequence)}/{self.sequence_length}", end='', flush=True)
         
         if confidence >= self.gesture_threshold:
-            return self.le.inverse_transform([idx])[0], confidence
+            return predicted_class, confidence
         return None, confidence
     
     def process_frame(self, frame):
@@ -93,7 +104,7 @@ class SignLanguageTranslator:
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = self.hands.process(rgb_frame)
         
-        # Extract landmarks and add to sequence
+        # Extract landmarks and add to sequence continuously
         landmarks = self._extract_hand_landmarks(results)
         self.sequence.append(landmarks)
         
@@ -103,10 +114,10 @@ class SignLanguageTranslator:
                 self.mp_drawing.draw_landmarks(
                     frame, hand_landmarks, self.mp_hands.HAND_CONNECTIONS)
         
-        # Predict gesture
+        # Predict gesture continuously
         gesture, confidence = self._predict_gesture()
         
-        # Update state
+        # Update state continuously
         current_time = time.time()
         if gesture:
             if gesture != self.last_prediction:
@@ -121,37 +132,33 @@ class SignLanguageTranslator:
                 
             self.last_prediction = gesture
         
-        # Check for sentence completion
-        sentence_complete = False
-        if self.current_sentence and (current_time - self.last_gesture_time) >= self.pause_threshold:
-            sentence_complete = True
+        # Check if finalized sentence should be cleared (after 3 seconds)
+        if self.sentence_finalized and (current_time - self.finalized_time) >= 3.0:
+            self.sentence_finalized = False
+            self.finalized_text = ""
             
         # Draw UI
         self._draw_ui(frame, gesture, confidence, current_time)
         
-        return frame, sentence_complete
+        return frame, current_time
     
     def _draw_ui(self, frame, gesture, confidence, current_time):
         """Draw the UI elements on the frame."""
-        # Draw current gesture and confidence
-        if gesture:
-            text = f"{gesture} ({confidence*100:.1f}%)"
-            cv2.putText(frame, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        # Show hand detection status as green dot
+        hands_detected = len(self.sequence) > 0 and np.sum(self.sequence[-1]) > 0
+        dot_color = (0, 255, 0) if hands_detected else (0, 0, 255)
+        cv2.circle(frame, (frame.shape[1] - 30, 30), 15, dot_color, -1)
         
-        # Draw current sentence
+        # Draw current sentence at bottom
         if self.current_sentence:
             sentence = " ".join(self.current_sentence)
-            cv2.putText(frame, sentence, (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+            cv2.putText(frame, sentence, (10, frame.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
         
-        # Draw pause timer
-        if self.current_sentence:
-            time_since_last = current_time - self.last_gesture_time
-            if time_since_last < self.pause_threshold:
-                progress = int((time_since_last / self.pause_threshold) * 100)
-                bar_width = 200
-                filled_width = int((progress / 100) * bar_width)
-                cv2.rectangle(frame, (10, 90), (10 + bar_width, 100), (0, 0, 255), 2)
-                cv2.rectangle(frame, (10, 90), (10 + filled_width, 100), (0, 0, 255), -1)
+        # Draw finalized sentence (green, will disappear after 3 seconds)
+        if self.sentence_finalized:
+            time_remaining = 3.0 - (current_time - self.finalized_time)
+            cv2.putText(frame, f"SAVED: {self.finalized_text}", (10, frame.shape[0] - 60), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+            cv2.putText(frame, f"Clearing in {time_remaining:.1f}s", (10, frame.shape[0] - 100), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
     
     def get_current_sentence(self):
         """Get the current sentence and reset if completed."""
@@ -164,6 +171,29 @@ class SignLanguageTranslator:
         self.consecutive_frames = 0
         return sentence
     
+    def finalize_sentence(self):
+        """Finalize and save the current sentence."""
+        if not self.current_sentence:
+            return None
+        
+        sentence = self.get_current_sentence()
+        if sentence:
+            self.finalized_text = sentence
+            self.sentence_finalized = True
+            self.finalized_time = time.time()
+            self.save_to_output_file(sentence)
+            return sentence
+        return None
+    
+    def save_to_output_file(self, sentence):
+        """Save the translated sentence to output file for English-to-Konkani model."""
+        try:
+            with open(self.output_file, 'a', encoding='utf-8') as f:
+                f.write(sentence + '\n')
+            print(f"Saved to {self.output_file}: {sentence}")
+        except Exception as e:
+            print(f"Error saving to file: {e}")
+    
     def __del__(self):
         """Clean up resources."""
         self.hands.close()
@@ -173,10 +203,31 @@ def main():
     cap = cv2.VideoCapture(0)
     translator = SignLanguageTranslator()
     
-    print("\nISL to English Translator")
-    print("------------------------")
-    print("Press 'q' to quit")
-    print("Make signs and pause for 2 seconds to complete a sentence")
+    # Clear output file at start
+    try:
+        with open(translator.output_file, 'w', encoding='utf-8') as f:
+            f.write('')
+        print(f"Output file cleared: {translator.output_file}")
+    except Exception as e:
+        print(f"Warning: Could not clear output file: {e}")
+    
+    print("\n" + "="*60)
+    print("ISL to English Translator")
+    print("="*60)
+    print(f"Model loaded: {len(translator.le.classes_)} gestures")
+    print(f"Available gestures: {', '.join(sorted(translator.le.classes_))}")
+    print(f"Gesture threshold: {translator.gesture_threshold} (lowered for easier detection)")
+    print("="*60)
+    print("\nControls:")
+    print("  SPACE - Save current sentence and reset")
+    print("  q - Quit")
+    print("\nInstructions:")
+    print("  1. Make gestures - they appear in real-time")
+    print("  2. Hold gesture steady for best detection")
+    print("  3. Watch the buffer fill up (30 frames needed)")
+    print("  4. Press SPACE when you want to save the sentence")
+    print(f"\nOutput saved to: {translator.output_file}")
+    print("="*60 + "\n")
     
     while cap.isOpened():
         ret, frame = cap.read()
@@ -185,20 +236,25 @@ def main():
             break
             
         # Process frame
-        frame, sentence_complete = translator.process_frame(frame)
+        frame, current_time = translator.process_frame(frame)
         
         # Show frame
         cv2.imshow('ISL to English Translator', frame)
         
-        # Check for sentence completion
-        if sentence_complete:
-            sentence = translator.get_current_sentence()
-            if sentence:
-                print(f"\nTranslated: {sentence}")
+        # Check for key presses
+        key = cv2.waitKey(1) & 0xFF
         
-        # Check for quit
-        if cv2.waitKey(1) & 0xFF == ord('q'):
+        if key == ord('q'):
             break
+        elif key == ord(' '):
+            # Finalize and save current sentence
+            sentence = translator.finalize_sentence()
+            if sentence:
+                print(f"\n{'='*60}")
+                print(f"SAVED: {sentence}")
+                print(f"{'='*60}\n")
+            else:
+                print("\nNo sentence to save (make some gestures first)\n")
     
     cap.release()
     cv2.destroyAllWindows()

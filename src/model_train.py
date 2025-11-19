@@ -18,6 +18,20 @@ except Exception:
 logging.basicConfig(level=logging.INFO,
                    format='%(asctime)s - %(levelname)s - %(message)s')
 
+# Configure GPU
+gpus = tf.config.list_physical_devices('GPU')
+if gpus:
+    try:
+        # Enable memory growth to prevent TensorFlow from allocating all GPU memory
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        logging.info(f"GPU available: {len(gpus)} GPU(s) detected")
+        logging.info(f"GPU devices: {[gpu.name for gpu in gpus]}")
+    except RuntimeError as e:
+        logging.warning(f"GPU configuration error: {e}")
+else:
+    logging.warning("No GPU detected. Training will use CPU.")
+
 
 def train_model(epochs=50, batch_size=32, validation_split=0.2):
     logging.info("Starting model training process...")
@@ -31,6 +45,9 @@ def train_model(epochs=50, batch_size=32, validation_split=0.2):
     logging.info("Loading dataset...")
     X, y = load_dataset(expected_frame_length=126, maxlen=30)
     
+    if len(X) == 0 or len(y) == 0:
+        raise ValueError("No data loaded. Please check your dataset directory.")
+    
     # Encode labels
     le = LabelEncoder()
     y_encoded = le.fit_transform(y)
@@ -41,6 +58,16 @@ def train_model(epochs=50, batch_size=32, validation_split=0.2):
         f.write("\n".join(le.classes_))
     
     logging.info(f"Found {len(le.classes_)} unique classes: {le.classes_}")
+    
+    # Log class distribution
+    unique, counts = np.unique(y, return_counts=True)
+    class_distribution = dict(zip(unique, counts))
+    logging.info(f"Class distribution: {class_distribution}")
+    
+    # Check for minimum samples per class
+    min_samples = min(counts)
+    if min_samples < 5:
+        logging.warning(f"Some classes have very few samples (minimum: {min_samples}). Consider collecting more data.")
   
     # Split dataset
     X_train, X_test, y_train, y_test = train_test_split(
@@ -105,7 +132,11 @@ def train_model(epochs=50, batch_size=32, validation_split=0.2):
     
     # Evaluate model
     logging.info("Evaluating model...")
-    test_loss, test_acc, test_top3 = model.evaluate(X_test, y_test, verbose=0)
+    eval_results = model.evaluate(X_test, y_test, verbose=0)
+    test_loss = eval_results[0]
+    test_acc = eval_results[1] if len(eval_results) > 1 else 0.0
+    test_top3 = eval_results[2] if len(eval_results) > 2 else 0.0
+    logging.info(f"Test loss: {test_loss:.4f}")
     logging.info(f"Test accuracy: {test_acc:.4f}")
     logging.info(f"Top-3 accuracy: {test_top3:.4f}")
     
@@ -113,12 +144,9 @@ def train_model(epochs=50, batch_size=32, validation_split=0.2):
     hist_df = pd.DataFrame(history.history)
     hist_df.to_csv(os.path.join(model_dir, 'training_history.csv'), index=False)
     
-    # Save model architecture diagram
-    tf.keras.utils.plot_model(
-        model,
-        to_file=os.path.join(model_dir, 'model_architecture.png'),
-        show_shapes=True
-    )
+    # Save model summary to text file
+    with open(os.path.join(model_dir, 'model_summary.txt'), 'w') as f:
+        model.summary(print_fn=lambda x: f.write(x + '\n'))
     
     logging.info(f"Training complete. Model and artifacts saved to {model_dir}")
     
