@@ -9,6 +9,7 @@ mp_hands = mp.solutions.hands
 mp_drawing = mp.solutions.drawing_utils
 
 DATA_PATH = "data/dataset"
+SENTENCE_PATH = "data/sentences"
 
 
 def _extract_two_hand_landmarks_from_results(results):
@@ -58,7 +59,7 @@ def collect_data(gesture_name, num_samples=30, sequence_length=30):
     """
     cap = cv2.VideoCapture(0)
     cap.set(cv2.CAP_PROP_FPS, 60)  # Set to 60fps
-    hands = mp_hands.Hands(max_num_hands=2, min_detection_confidence=0.5, min_tracking_confidence=0.5)
+    hands = mp_hands.Hands(max_num_hands=2, min_detection_confidence=0.3, min_tracking_confidence=0.3)
     os.makedirs(os.path.join(DATA_PATH, gesture_name), exist_ok=True)
 
     collected_count = 0
@@ -131,6 +132,9 @@ def collect_data(gesture_name, num_samples=30, sequence_length=30):
         if recording:
             landmarks = _extract_two_hand_landmarks_from_results(results)
             sequence.append(landmarks)
+            # Debug: check if we're getting real data
+            if len(sequence) % 30 == 0 and sum(landmarks) != 0:
+                print(f"  Frame {len(sequence)}: capturing hand data...")
 
         cv2.imshow("Collecting Data", frame)
         
@@ -171,6 +175,106 @@ def collect_data(gesture_name, num_samples=30, sequence_length=30):
     print(f"Collection complete: {collected_count}/{num_samples} sequences saved")
     print(f"Location: {os.path.join(DATA_PATH, gesture_name)}")
     print(f"{'='*60}\n")
+
+
+def collect_sentence(sentence_label):
+    """Capture a full sentence-level gesture stream.
+
+    SPACE toggles start/stop capture. While capturing we record every frame's
+    landmarks (126 features). On stop a single CSV sequence is written under
+    data/sentences/<sentence_label>/sequence_<n>.csv containing all frames.
+    Also append/update sentences.csv with mapping: sentence_label,frames,count.
+    """
+    os.makedirs(SENTENCE_PATH, exist_ok=True)
+    sentence_dir = os.path.join(SENTENCE_PATH, sentence_label)
+    os.makedirs(sentence_dir, exist_ok=True)
+
+    # Determine next sequence index
+    existing = [f for f in os.listdir(sentence_dir) if f.startswith("sequence_") and f.endswith(".csv")]
+    next_idx = 0
+    if existing:
+        try:
+            nums = [int(f.replace("sequence_", "").replace(".csv", "")) for f in existing]
+            next_idx = max(nums) + 1
+        except Exception:
+            pass
+
+    cap = cv2.VideoCapture(0)
+    cap.set(cv2.CAP_PROP_FPS, 60)
+    hands = mp_hands.Hands(max_num_hands=2, min_detection_confidence=0.5, min_tracking_confidence=0.5)
+
+    capturing = False
+    frames = []
+    print(f"\n{'='*60}")
+    print(f"Sentence capture for label: '{sentence_label}'")
+    print("Press SPACE to start, SPACE again to stop & save, Q to quit.")
+    print(f"Output directory: {sentence_dir}")
+    print(f"{'='*60}\n")
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        frame = cv2.flip(frame, 1)
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = hands.process(rgb)
+        h, w = frame.shape[:2]
+
+        # Draw landmarks
+        if results and results.multi_hand_landmarks:
+            for hand_landmarks in results.multi_hand_landmarks:
+                mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+
+        # Status dot
+        cv2.circle(frame, (20,20), 8, (0,0,255) if not capturing else (0,255,0), -1)
+
+        # Instructions & state
+        instr = "SPACE start/stop | Q quit"
+        cv2.putText(frame, instr, (10, h-15), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255,255,255), 1)
+        state = f"Capturing frames: {len(frames)}" if capturing else "Idle"
+        cv2.putText(frame, state, (40,25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
+
+        # Record if capturing
+        if capturing:
+            frames.append(_extract_two_hand_landmarks_from_results(results))
+
+        cv2.imshow("Sentence Capture", frame)
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
+            break
+        elif key == ord(' '):
+            if not capturing:
+                capturing = True
+                frames = []
+                print("● Started sentence capture. Press SPACE to finish.")
+            else:
+                capturing = False
+                if len(frames) < 5:
+                    print(f"✗ Capture too short ({len(frames)} frames). Discarded.")
+                    frames = []
+                    continue
+                # Save sequence
+                out_file = os.path.join(sentence_dir, f"sequence_{next_idx}.csv")
+                with open(out_file, 'w', newline='', encoding='utf-8') as f:
+                    writer = csv.writer(f)
+                    writer.writerows(frames)
+                print(f"✓ Saved sentence sequence '{out_file}' ({len(frames)} frames)")
+                # Update sentences.csv summary
+                summary_path = os.path.join(SENTENCE_PATH, 'sentences.csv')
+                header_needed = not os.path.exists(summary_path)
+                with open(summary_path, 'a', newline='', encoding='utf-8') as f:
+                    writer = csv.writer(f)
+                    if header_needed:
+                        writer.writerow(["sentence_label","sequence_index","frames"])
+                    writer.writerow([sentence_label, next_idx, len(frames)])
+                next_idx += 1
+                frames = []
+                print("Press SPACE to record another sentence stream or Q to quit.")
+
+    cap.release()
+    cv2.destroyAllWindows()
+    hands.close()
+    print("Sentence capture ended.")
 
 
 def convert_images_to_sequences(images_root="data/handsigns", output_root=DATA_PATH, frames_per_sequence=30):

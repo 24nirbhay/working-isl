@@ -24,6 +24,7 @@ class RealTimeTranslator:
         self.current_sequence = []
         self.sentence = []
         self.current_confidence = 0.0  # Track current prediction confidence
+        self.capturing = False  # Sentence-level capture state
         
         # Load model with custom objects
         model_file = os.path.join(model_path, 'model.keras')
@@ -35,7 +36,7 @@ class RealTimeTranslator:
         
         # Detection parameters
         self.threshold = 0.6  # Confidence threshold
-        self.min_consecutive_frames = 5  # Frames needed for detection
+        self.min_consecutive_frames = 3  # Frames needed for detection (reduced for responsiveness)
         self.consecutive_count = 0
         self.last_prediction = None
         self.gesture_cooldown = 0  # Cooldown to prevent duplicate detections
@@ -44,10 +45,41 @@ class RealTimeTranslator:
         print(f"Model loaded from {model_path}")
         print(f"Gestures: {list(self.label_encoder.classes_)}")
         print("\nControls:")
-        print("  SPACE - Finalize and save sentence")
-        print("  C - Clear current sentence")
-        print("  Q - Quit")
-        print("\nContinuous gesture detection active...")
+        print("  SPACE - Start/Stop sentence capture")
+        print("  C     - Clear current sentence (while capturing)")
+        print("  Q     - Quit")
+        print("\nPress SPACE to begin capturing a sentence of gestures.")
+        self._ensure_translation_file()
+
+    def _ensure_translation_file(self):
+        if not os.path.exists("translations.txt"):
+            with open("translations.txt", "w", encoding="utf-8") as f:
+                pass
+
+    def _update_translation_file(self, finalize=False):
+        """Update the translations.txt file with current sentence.
+        While capturing, we overwrite the last line with the in-progress sentence.
+        On finalize we append a newline (persist sentence)."""
+        sentence_text = " ".join(self.sentence)
+        if not os.path.exists("translations.txt"):
+            self._ensure_translation_file()
+        with open("translations.txt", "r", encoding="utf-8") as f:
+            lines = [l.rstrip("\n") for l in f.readlines()]
+        if finalize:
+            # Append finalized sentence
+            if sentence_text:
+                lines.append(sentence_text)
+        else:
+            # Overwrite last line with in-progress sentence
+            if lines and (self.capturing or sentence_text):
+                lines[-1] = sentence_text
+            else:
+                # Start a new in-progress line
+                lines.append(sentence_text)
+        # Write all lines with newline termination for clarity in viewers
+        with open("translations.txt", "w", encoding="utf-8") as f:
+            for line in lines:
+                f.write(line + "\n")
     
     def _extract_hand_landmarks(self, results):
         """Extract hand landmarks from MediaPipe results.
@@ -126,10 +158,9 @@ class RealTimeTranslator:
             for hand_landmarks in results.multi_hand_landmarks:
                 mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
         
-        # Add to sequence if hands detected
-        if sum(landmarks) != 0:
+        # Only collect and predict gestures if currently capturing
+        if self.capturing and sum(landmarks) != 0:
             self.current_sequence.append(landmarks)
-            # Keep only recent frames for continuous detection
             if len(self.current_sequence) > self.max_sequence_length:
                 self.current_sequence.pop(0)
         
@@ -137,10 +168,16 @@ class RealTimeTranslator:
         if self.gesture_cooldown > 0:
             self.gesture_cooldown -= 1
         
-        # Continuous prediction if we have enough frames and no cooldown
-        if len(self.current_sequence) >= 5 and self.gesture_cooldown == 0:
+        # Continuous prediction if we have enough frames, no cooldown, and capturing
+        if self.capturing and len(self.current_sequence) >= 5 and self.gesture_cooldown == 0:
             gesture, confidence = self._predict_gesture(self.current_sequence)
             self.current_confidence = confidence  # Store for UI display
+            # Debug print for predicted gesture (helps troubleshoot missing updates)
+            if confidence >= self.threshold:
+                try:
+                    print(f"Prediction: {gesture} (conf={confidence:.2f})")
+                except Exception:
+                    print(f"Prediction: idx? (conf={confidence:.2f})")
             
             if gesture:
                 if gesture == self.last_prediction:
@@ -157,11 +194,12 @@ class RealTimeTranslator:
                     self.last_prediction = None
                     self.gesture_cooldown = self.cooldown_frames  # Start cooldown
                     print(f"  Detected: {gesture} ({confidence:.2f})")
+                    # Update translation file live
+                    self._update_translation_file(finalize=False)
             else:
                 self.consecutive_count = 0
                 self.last_prediction = None
         else:
-            # Reset confidence when not actively predicting
             if len(self.current_sequence) < 5:
                 self.current_confidence = 0.0
         
@@ -175,7 +213,8 @@ class RealTimeTranslator:
         h, w, _ = frame.shape
         
         # Top-left controls (smaller font - 5px)
-        controls_text = "SPACE: Save | C: Clear | Q: Quit"
+        status = "CAPTURING" if self.capturing else "IDLE"
+        controls_text = f"SPACE start/stop | C clear | Q quit ({status})"
         cv2.putText(frame, controls_text, (10, 20), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
         
@@ -207,17 +246,16 @@ class RealTimeTranslator:
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
     
     def finalize_sentence(self):
-        """Save and clear the current sentence."""
+        """Finalize current sentence (stop capturing if active)."""
+        if self.capturing:
+            self.capturing = False
         if self.sentence:
             sentence_text = " ".join(self.sentence)
-            print(f"\n✓ Saved: {sentence_text}\n")
-            
-            # Save to file
-            with open("translations.txt", "a", encoding="utf-8") as f:
-                f.write(sentence_text + "\n")
-            
-            self.sentence = []
-            self.current_sequence = []
+            print(f"\n✓ Finalized: {sentence_text}\n")
+            self._update_translation_file(finalize=True)
+        self.sentence = []
+        self.current_sequence = []
+        self.current_confidence = 0.0
     
     def clear_sentence(self):
         """Clear the current sentence without saving."""
@@ -225,6 +263,7 @@ class RealTimeTranslator:
         self.current_sequence = []
         self.consecutive_count = 0
         self.last_prediction = None
+        self._update_translation_file(finalize=False)
         print("\n✗ Sentence cleared\n")
 
 
@@ -272,8 +311,20 @@ def main():
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
                 break
-            elif key == ord(' '):  # Space to finalize
-                translator.finalize_sentence()
+            elif key == ord(' '):  # Space toggles capture / finalize sentence
+                if not translator.capturing:
+                    translator.capturing = True
+                    translator.sentence = []
+                    translator.current_sequence = []
+                    # Reset detection state
+                    translator.consecutive_count = 0
+                    translator.last_prediction = None
+                    translator.gesture_cooldown = 0
+                    translator.current_confidence = 0.0
+                    translator._update_translation_file(finalize=False)
+                    print("\n● Started sentence capture. Perform gestures... Press SPACE to stop.\n")
+                else:
+                    translator.finalize_sentence()
             elif key == ord('c'):  # C to clear
                 translator.clear_sentence()
     

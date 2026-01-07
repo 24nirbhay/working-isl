@@ -8,10 +8,10 @@ import os
 import logging
 from datetime import datetime
 try:
-    from .preprocess import load_dataset
+    from .preprocess import load_dataset, load_datasets, DATA_PATH, SENTENCE_PATH
     from .model_architecture import create_sign_language_model
 except Exception:
-    from preprocess import load_dataset
+    from preprocess import load_dataset, load_datasets, DATA_PATH, SENTENCE_PATH
     from model_architecture import create_sign_language_model
 
 # Set up logging
@@ -33,7 +33,7 @@ else:
     logging.warning("No GPU detected. Training will use CPU.")
 
 
-def train_model(epochs=50, batch_size=32, validation_split=0.2):
+def train_model(epochs=50, batch_size=50, validation_split=0.2, roots=None):
     logging.info("Starting model training process...")
     
     # Create timestamped model directory
@@ -43,7 +43,27 @@ def train_model(epochs=50, batch_size=32, validation_split=0.2):
     
     # Load and preprocess dataset
     logging.info("Loading dataset...")
-    X, y = load_dataset(expected_frame_length=126, maxlen=30)
+    if roots is None:
+        # Default: gestures dataset; include sentences automatically if present
+        roots = [DATA_PATH]
+        if os.path.isdir(SENTENCE_PATH):
+            # Include if it contains at least one label directory with CSVs
+            has_data = False
+            for label in os.listdir(SENTENCE_PATH):
+                label_path = os.path.join(SENTENCE_PATH, label)
+                if os.path.isdir(label_path) and any(f.endswith('.csv') for f in os.listdir(label_path)):
+                    has_data = True
+                    break
+            if has_data:
+                logging.info("Including sentence streams from data/sentences in training dataset")
+                roots.append(SENTENCE_PATH)
+            else:
+                logging.info("data/sentences present but empty; ignoring")
+
+    if len(roots) == 1:
+        X, y = load_datasets(roots, expected_frame_length=126, maxlen=30)
+    else:
+        X, y = load_datasets(roots, expected_frame_length=126, maxlen=30)
     
     if len(X) == 0 or len(y) == 0:
         raise ValueError("No data loaded. Please check your dataset directory.")
