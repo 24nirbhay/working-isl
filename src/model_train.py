@@ -33,7 +33,7 @@ else:
     logging.warning("No GPU detected. Training will use CPU.")
 
 
-def train_model(epochs=50, batch_size=50, validation_split=0.2, roots=None):
+def train_model(epochs=40, batch_size=50, validation_split=0.2, roots=None):
     logging.info("Starting model training process...")
     
     # Create timestamped model directory
@@ -72,12 +72,19 @@ def train_model(epochs=50, batch_size=50, validation_split=0.2, roots=None):
     le = LabelEncoder()
     y_encoded = le.fit_transform(y)
     
-    # Save label encoder
-    dump(le, os.path.join(model_dir, "label_encoder.joblib"))
-    with open(os.path.join(model_dir, "classes.txt"), "w") as f:
-        f.write("\n".join(le.classes_))
+    logging.info(f"Found {len(le.classes_)} unique classes: {list(le.classes_)}")
     
-    logging.info(f"Found {len(le.classes_)} unique classes: {le.classes_}")
+    # Save label encoder immediately (IMPORTANT: before training in case of error)
+    label_encoder_path = os.path.join(model_dir, "label_encoder.joblib")
+    classes_path = os.path.join(model_dir, "classes.txt")
+    try:
+        dump(le, label_encoder_path)
+        with open(classes_path, "w") as f:
+            f.write("\n".join(le.classes_))
+        logging.info(f"Label encoder saved. Classes: {list(le.classes_)}")
+    except Exception as e:
+        logging.error(f"Failed to save label encoder: {e}")
+        raise
     
     # Log class distribution
     unique, counts = np.unique(y, return_counts=True)
@@ -148,24 +155,34 @@ def train_model(epochs=50, batch_size=50, validation_split=0.2, roots=None):
     
     # Train model
     logging.info("Starting training...")
-    history = model.fit(
-        X_train, y_train,
-        epochs=epochs,
-        batch_size=batch_size,
-        validation_data=(X_test, y_test),
-        callbacks=callbacks,
-        verbose=1
-    )
+    try:
+        history = model.fit(
+            X_train, y_train,
+            epochs=epochs,
+            batch_size=batch_size,
+            validation_data=(X_test, y_test),
+            callbacks=callbacks,
+            verbose=1
+        )
+    except Exception as e:
+        logging.error(f"Training failed: {e}")
+        logging.info(f"Label encoder already saved with all {len(le.classes_)} classes.")
+        with open(os.path.join(model_dir, 'training_error.log'), 'w') as f:
+            f.write(f"Training error: {str(e)}")
+        raise
     
     # Evaluate model
     logging.info("Evaluating model...")
-    eval_results = model.evaluate(X_test, y_test, verbose=0)
-    test_loss = eval_results[0]
-    test_acc = eval_results[1] if len(eval_results) > 1 else 0.0
-    test_top3 = eval_results[2] if len(eval_results) > 2 else 0.0
-    logging.info(f"Test loss: {test_loss:.4f}")
-    logging.info(f"Test accuracy: {test_acc:.4f}")
-    logging.info(f"Top-3 accuracy: {test_top3:.4f}")
+    try:
+        eval_results = model.evaluate(X_test, y_test, verbose=0)
+        test_loss = eval_results[0]
+        test_acc = eval_results[1] if len(eval_results) > 1 else 0.0
+        test_top3 = eval_results[2] if len(eval_results) > 2 else 0.0
+        logging.info(f"Test loss: {test_loss:.4f}")
+        logging.info(f"Test accuracy: {test_acc:.4f}")
+        logging.info(f"Top-3 accuracy: {test_top3:.4f}")
+    except Exception as e:
+        logging.warning(f"Evaluation failed: {e}. Model still trained and saved.")
     
     # Save training history
     hist_df = pd.DataFrame(history.history)

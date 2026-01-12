@@ -277,18 +277,18 @@ def collect_sentence(sentence_label):
     print("Sentence capture ended.")
 
 
-def convert_images_to_sequences(images_root="data/handsigns", output_root=DATA_PATH, frames_per_sequence=30):
-    """Convert existing hand-sign images into sequences for training.
-    
-    Takes images from images_root/<gesture>/*.{jpg,png} and creates sequences by:
-    1. Processing each image to extract landmarks
-    2. Grouping images into sequences of specified length
-    3. Saving as CSV files in output_root/<gesture>/sequence_*.csv
-    
+def convert_images_to_sequences(images_root="data/handsigns", output_root=DATA_PATH,
+                                frames_per_sequence=30, stride=10):
+    """Convert hand-sign images into temporal sequences for training/testing.
+
+    Images are ordered (sorted filenames) and converted to landmarks, then sliced
+    into overlapping windows to approximate the motion/transition of each gesture.
+
     Args:
-        images_root: Path to directory containing gesture subdirectories with images
-        output_root: Path to save generated sequence CSVs
-        frames_per_sequence: Number of images to group into each sequence
+        images_root: Directory containing gesture subdirectories with images
+        output_root: Directory to save generated sequence CSVs
+        frames_per_sequence: Window size (frames per sequence)
+        stride: Step between window starts; smaller stride -> more overlap
     """
     if not os.path.exists(images_root):
         print(f"Error: Images directory not found: {images_root}")
@@ -341,32 +341,28 @@ def convert_images_to_sequences(images_root="data/handsigns", output_root=DATA_P
         
         print(f"  ✓ Extracted landmarks from {len(landmarks_list)} images")
         
-        # Group into sequences
-        num_sequences = len(landmarks_list) // frames_per_sequence
-        if num_sequences == 0:
-            # If we don't have enough for a full sequence, create one by repeating
-            sequence = landmarks_list * (frames_per_sequence // len(landmarks_list) + 1)
-            sequence = sequence[:frames_per_sequence]
-            
-            file_path = os.path.join(output_dir, "sequence_0.csv")
+        # Build overlapping temporal windows
+        if len(landmarks_list) < frames_per_sequence:
+            # Pad by repeating last frame to reach window length
+            padded = landmarks_list + [landmarks_list[-1]] * (frames_per_sequence - len(landmarks_list))
+            windows = [padded]
+        else:
+            windows = []
+            for start in range(0, len(landmarks_list) - frames_per_sequence + 1, stride):
+                end = start + frames_per_sequence
+                windows.append(landmarks_list[start:end])
+            # Ensure tail coverage
+            if (len(landmarks_list) - frames_per_sequence) % stride != 0:
+                tail = landmarks_list[-frames_per_sequence:]
+                windows.append(tail)
+
+        for seq_idx, sequence in enumerate(windows):
+            file_path = os.path.join(output_dir, f"sequence_{seq_idx}.csv")
             with open(file_path, mode='w', newline='', encoding='utf-8') as f:
                 csv.writer(f).writerows(sequence)
             total_sequences += 1
-            print(f"  ✓ Created 1 sequence (repeated {len(landmarks_list)} landmarks to fill)")
-        else:
-            # Create multiple sequences
-            for seq_idx in range(num_sequences):
-                start_idx = seq_idx * frames_per_sequence
-                end_idx = start_idx + frames_per_sequence
-                sequence = landmarks_list[start_idx:end_idx]
-                
-                file_path = os.path.join(output_dir, f"sequence_{seq_idx}.csv")
-                with open(file_path, mode='w', newline='', encoding='utf-8') as f:
-                    csv.writer(f).writerows(sequence)
-                total_sequences += 1
-            
-            remaining = len(landmarks_list) % frames_per_sequence
-            print(f"  ✓ Created {num_sequences} sequences ({remaining} images unused)")
+
+        print(f"  ✓ Created {len(windows)} sequence(s) (window={frames_per_sequence}, stride={stride})")
     
     print(f"\n{'='*60}")
     print(f"Conversion complete!")
@@ -418,6 +414,126 @@ def extract_landmarks_from_image_file(image_path, debug=False):
     
     hands.close()
     return landmarks
+
+
+def extract_landmarks_from_video_file(video_path, skip_empty_frames=True, debug=False):
+    """Process a video file frame-by-frame and return list of 126-length landmark lists.
+    
+    Video-first temporal learning:
+    - Extracts ALL frames in order
+    - Detects landmarks per frame
+    - Skips frames with no hands (if skip_empty_frames=True) OR includes them as zeros
+    - Returns one temporal sequence per video (all valid landmarks)
+    - Video filename (minus extension) becomes the gesture class label
+    
+    Args:
+        video_path: Path to video file (.mp4, .avi, .mov, .mkv, etc.)
+        skip_empty_frames: If True, skip frames with no detected hands; if False, include as zero vectors
+        debug: If True, save debug frame with landmarks drawn
+    
+    Returns:
+        Tuple: (all_landmarks, frame_count, valid_landmarks_count)
+               all_landmarks: List of 126-length landmark vectors
+               frame_count: Total frames processed
+               valid_landmarks_count: Frames with detected hands
+    """
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print(f"Could not open video: {video_path}")
+        return [], 0, 0
+    
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    
+    hands = mp_hands.Hands(
+        static_image_mode=False,
+        max_num_hands=2,
+        min_detection_confidence=0.5,
+        min_tracking_confidence=0.3
+    )
+    
+    all_landmarks = []
+    frame_count = 0
+    valid_landmarks_count = 0
+    
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        
+        # Resize if too large
+        max_dim = 1280
+        h, w = frame.shape[:2]
+        if h > max_dim or w > max_dim:
+            scale = max_dim / max(h, w)
+            frame = cv2.resize(frame, None, fx=scale, fy=scale)
+        
+        img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = hands.process(img_rgb)
+        landmarks = _extract_two_hand_landmarks_from_results(results)
+        
+        # Check if frame has valid hand landmarks
+        has_hands = results and results.multi_hand_landmarks and len(results.multi_hand_landmarks) > 0
+        
+        if has_hands:
+            all_landmarks.append(landmarks)
+            valid_landmarks_count += 1
+        elif not skip_empty_frames:
+            # Include zero vector for frames without hands
+            all_landmarks.append(landmarks)
+        # If skip_empty_frames=True and no hands, just skip this frame
+        
+        if debug and frame_count == 0:
+            # Save debug frame (first frame only)
+            debug_img = frame.copy()
+            if results.multi_hand_landmarks:
+                for hand_landmarks in results.multi_hand_landmarks:
+                    mp_drawing = mp.solutions.drawing_utils
+                    mp_drawing.draw_landmarks(debug_img, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+            debug_dir = os.path.join("data", "debug_detection")
+            os.makedirs(debug_dir, exist_ok=True)
+            base_name = os.path.splitext(os.path.basename(video_path))[0]
+            debug_path = os.path.join(debug_dir, f"{base_name}_debug_frame0.jpg")
+            cv2.imwrite(debug_path, debug_img)
+        
+        frame_count += 1
+    
+    cap.release()
+    hands.close()
+    
+    print(f"  Video: {os.path.basename(video_path)} | Frames: {frame_count} | Valid: {valid_landmarks_count} | Sequence length: {len(all_landmarks)}")
+    return all_landmarks, frame_count, valid_landmarks_count
+
+
+def build_sliding_windows(landmarks_list, window_size=10, stride=5):
+    """Create overlapping temporal windows from landmark sequence.
+    
+    A gesture is typically 10-30 frames of motion. Sliding windows capture
+    different parts of the gesture, generating multiple training samples from one video.
+    
+    Args:
+        landmarks_list: List of 126-feature landmark vectors
+        window_size: Frames per window (10 = ~0.3s at 30fps, recommended for single gesture)
+        stride: Step size between windows (smaller = more overlap = more training data)
+    
+    Returns:
+        List of windows, each containing window_size landmark vectors
+    """
+    if len(landmarks_list) < window_size:
+        # If video is shorter than window, pad with last frame
+        padded = landmarks_list + [landmarks_list[-1]] * (window_size - len(landmarks_list))
+        return [padded]
+    
+    windows = []
+    for start in range(0, len(landmarks_list) - window_size + 1, stride):
+        end = start + window_size
+        windows.append(landmarks_list[start:end])
+    
+    # Ensure we capture the tail (last window)
+    if (len(landmarks_list) - window_size) % stride != 0:
+        windows.append(landmarks_list[-window_size:])
+    
+    return windows
 
 
 def split_large_sequence(gesture_name, sequence_file, target_length=30, overlap=10):

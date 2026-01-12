@@ -20,6 +20,7 @@ class RealTimeTranslator:
             model_path: Path to the trained model directory
             max_sequence_length: Maximum sequence length for padding
         """
+        self.model_path = model_path
         self.max_sequence_length = max_sequence_length
         self.current_sequence = []
         self.sentence = []
@@ -34,6 +35,22 @@ class RealTimeTranslator:
         label_encoder_file = os.path.join(model_path, 'label_encoder.joblib')
         self.label_encoder = joblib.load(label_encoder_file)
         
+        # DEBUG: Verify all classes are loaded
+        print(f"\n{'='*60}")
+        print(f"Model loaded from {model_path}")
+        print(f"Loaded {len(self.label_encoder.classes_)} gesture classes:")
+        for idx, cls in enumerate(self.label_encoder.classes_):
+            print(f"  [{idx}] {cls}")
+        
+        # IMPORTANT: Show model accuracy warning if needed
+        print(f"\n*** IMPORTANT ***")
+        print(f"Model accuracy depends on training data quality.")
+        print(f"If model isn't detecting gestures:")
+        print(f"  1. Collect MORE training data (50+ samples per gesture)")
+        print(f"  2. Retrain: python app.py train")
+        print(f"  3. Test predictions: python test_predictions.py")
+        print(f"{'='*60}\n")
+        
         # Detection parameters
         self.threshold = 0.6  # Confidence threshold
         self.min_consecutive_frames = 3  # Frames needed for detection (reduced for responsiveness)
@@ -42,13 +59,11 @@ class RealTimeTranslator:
         self.gesture_cooldown = 0  # Cooldown to prevent duplicate detections
         self.cooldown_frames = 15  # Number of frames to wait
         
-        print(f"Model loaded from {model_path}")
-        print(f"Gestures: {list(self.label_encoder.classes_)}")
-        print("\nControls:")
-        print("  SPACE - Start/Stop sentence capture")
-        print("  C     - Clear current sentence (while capturing)")
-        print("  Q     - Quit")
-        print("\nPress SPACE to begin capturing a sentence of gestures.")
+        print(f"Controls:")
+        print(f"  SPACE - Start/Stop sentence capture")
+        print(f"  C     - Clear current sentence (while capturing)")
+        print(f"  Q     - Quit")
+        print(f"\nPress SPACE to begin capturing a sentence of gestures.")
         self._ensure_translation_file()
 
     def _ensure_translation_file(self):
@@ -118,7 +133,11 @@ class RealTimeTranslator:
         return left + right
     
     def _predict_gesture(self, sequence):
-        """Predict gesture from sequence of landmarks."""
+        """Predict gesture from sequence of landmarks.
+        
+        Returns gesture name and confidence regardless of threshold.
+        Caller decides what to do with low-confidence predictions.
+        """
         if len(sequence) == 0:
             return None, 0.0
         
@@ -134,11 +153,14 @@ class RealTimeTranslator:
         predicted_idx = np.argmax(predictions[0])
         confidence = predictions[0][predicted_idx]
         
-        if confidence >= self.threshold:
+        # Always return gesture name for debugging
+        try:
             gesture = self.label_encoder.inverse_transform([predicted_idx])[0]
-            return gesture, confidence
+        except (IndexError, ValueError):
+            print(f"ERROR: Could not decode predicted index {predicted_idx}")
+            return None, confidence
         
-        return None, confidence
+        return gesture, confidence
     
     def process_frame(self, frame, results):
         """Process a single frame and update detection state.
@@ -158,8 +180,8 @@ class RealTimeTranslator:
             for hand_landmarks in results.multi_hand_landmarks:
                 mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
         
-        # Only collect and predict gestures if currently capturing
-        if self.capturing and sum(landmarks) != 0:
+        # Collect landmarks for sequence (always, not just when capturing)
+        if sum(landmarks) != 0:
             self.current_sequence.append(landmarks)
             if len(self.current_sequence) > self.max_sequence_length:
                 self.current_sequence.pop(0)
@@ -168,16 +190,14 @@ class RealTimeTranslator:
         if self.gesture_cooldown > 0:
             self.gesture_cooldown -= 1
         
-        # Continuous prediction if we have enough frames, no cooldown, and capturing
-        if self.capturing and len(self.current_sequence) >= 5 and self.gesture_cooldown == 0:
+        # Continuous prediction if we have enough frames (predict always, add to sentence only when capturing)
+        if len(self.current_sequence) >= 5 and self.gesture_cooldown == 0:
             gesture, confidence = self._predict_gesture(self.current_sequence)
             self.current_confidence = confidence  # Store for UI display
-            # Debug print for predicted gesture (helps troubleshoot missing updates)
-            if confidence >= self.threshold:
-                try:
-                    print(f"Prediction: {gesture} (conf={confidence:.2f})")
-                except Exception:
-                    print(f"Prediction: idx? (conf={confidence:.2f})")
+            
+            # DEBUG: Show ALL predictions with confidence (even below threshold)
+            if confidence > 0.0:
+                print(f"Prediction: {gesture if gesture else 'None'} (conf={confidence:.2f}, threshold={self.threshold})")
             
             if gesture:
                 if gesture == self.last_prediction:
@@ -186,22 +206,27 @@ class RealTimeTranslator:
                     self.consecutive_count = 1
                     self.last_prediction = gesture
                 
-                # Add to sentence if we have enough consecutive detections
-                if self.consecutive_count >= self.min_consecutive_frames:
+                # Add to sentence ONLY if capturing AND enough consecutive detections
+                if self.capturing and self.consecutive_count >= self.min_consecutive_frames:
                     self.sentence.append(gesture)
+                    # Reset prediction state
                     self.current_sequence = []
                     self.consecutive_count = 0
                     self.last_prediction = None
-                    self.gesture_cooldown = self.cooldown_frames  # Start cooldown
-                    print(f"  Detected: {gesture} ({confidence:.2f})")
-                    # Update translation file live
+                    self.gesture_cooldown = self.cooldown_frames
+                    self.current_confidence = 0.0
+                    print(f"  ✓ Added to sentence: {gesture} ({confidence:.2f})")
+                    # Update translation file
                     self._update_translation_file(finalize=False)
             else:
+                # No confident prediction - reset counting
                 self.consecutive_count = 0
                 self.last_prediction = None
-        else:
-            if len(self.current_sequence) < 5:
-                self.current_confidence = 0.0
+        elif self.gesture_cooldown > 0:
+            # During cooldown, don't make new predictions and clear confidence
+            self.current_confidence = 0.0
+        elif len(self.current_sequence) < 5:
+            self.current_confidence = 0.0
         
         # Draw UI
         self._draw_ui(frame, results)
@@ -212,16 +237,19 @@ class RealTimeTranslator:
         """Draw UI elements on the frame."""
         h, w, _ = frame.shape
         
-        # Top-left controls (smaller font - 5px)
-        status = "CAPTURING" if self.capturing else "IDLE"
-        controls_text = f"SPACE start/stop | C clear | Q quit ({status})"
+        # Top-left: Controls and Status
+        controls_text = f"SPACE start/stop | C clear | Q quit"
         cv2.putText(frame, controls_text, (10, 20), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
         
-        # Top-right: Hand detection confidence (8px font)
+        status = "CAPTURING (record mode)" if self.capturing else "IDLE (preview mode)"
+        status_color = (0, 255, 0) if self.capturing else (100, 100, 100)
+        cv2.putText(frame, f"Status: {status}", (10, 40), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, status_color, 1)
+        
+        # Top-right: Hand detection confidence
         hand_confidence = 0.0
         if results and results.multi_hand_landmarks and results.multi_handedness:
-            # Get the highest confidence from detected hands
             for handedness in results.multi_handedness:
                 try:
                     score = handedness.classification[0].score
@@ -229,21 +257,41 @@ class RealTimeTranslator:
                 except Exception:
                     pass
         
-        confidence_text = f"Hand: {hand_confidence:.2f}"
-        cv2.putText(frame, confidence_text, (w - 120, 20), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        hand_text = f"Hand: {hand_confidence:.2f}"
+        cv2.putText(frame, hand_text, (w - 150, 20), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
         
-        # Show prediction confidence if available
-        if self.current_confidence > 0.0:
-            pred_text = f"Pred: {self.current_confidence:.2f}"
-            cv2.putText(frame, pred_text, (w - 120, 45), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        # Top-right: Current prediction (MAIN OUTPUT)
+        if self.last_prediction and self.current_confidence > 0.0:
+            pred_text = f"{self.last_prediction}"
+            conf_text = f"({self.current_confidence:.2f})"
+            
+            # Show prediction with color based on confidence
+            if self.current_confidence >= self.threshold:
+                color = (0, 255, 0)  # Green: confident
+            else:
+                color = (100, 100, 100)  # Gray: low confidence
+            
+            cv2.putText(frame, pred_text, (w - 180, 50), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+            cv2.putText(frame, conf_text, (w - 180, 75), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+        else:
+            # No prediction yet
+            cv2.putText(frame, "No detection", (w - 180, 50), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 100, 100), 1)
         
-        # Current sentence (bottom) - display directly without "Sentence:" prefix
-        sentence_text = " ".join(self.sentence) if self.sentence else ""
-        if sentence_text:
-            cv2.putText(frame, sentence_text, (10, h - 20),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        # Bottom: Current sentence being built
+        if self.sentence:
+            sentence_text = " ".join(self.sentence)
+            # Show as "Sentence: word1 word2 word3"
+            display_text = f"Sentence: {sentence_text}"
+            cv2.putText(frame, display_text, (10, h - 20),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        elif self.capturing:
+            # Show that we're recording but no words detected yet
+            cv2.putText(frame, "Recording... (perform gestures)", (10, h - 20),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1)
     
     def finalize_sentence(self):
         """Finalize current sentence (stop capturing if active)."""
@@ -316,10 +364,10 @@ def main():
                     translator.capturing = True
                     translator.sentence = []
                     translator.current_sequence = []
-                    # Reset detection state
+                    # Reset detection state to prevent false initial detections
                     translator.consecutive_count = 0
                     translator.last_prediction = None
-                    translator.gesture_cooldown = 0
+                    translator.gesture_cooldown = 0  # Ready to detect immediately
                     translator.current_confidence = 0.0
                     translator._update_translation_file(finalize=False)
                     print("\n● Started sentence capture. Perform gestures... Press SPACE to stop.\n")

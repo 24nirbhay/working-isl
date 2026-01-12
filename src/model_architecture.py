@@ -55,15 +55,16 @@ def create_sign_language_model(time_steps, feature_dim, num_classes):
     x = layers.BatchNormalization()(lstm_out)
     
     # Attention mechanism - focuses on important frames in the gesture
-    attention = layers.Dense(1, activation='tanh')(x)
-    attention = layers.Flatten()(attention)
-    attention = layers.Activation('softmax')(attention)
-    attention = layers.RepeatVector(128)(attention)  # 64*2 from Bidirectional
-    attention = layers.Permute([2, 1])(attention)
+    # Compute attention scores for each time step
+    attention_scores = layers.Dense(1, activation='relu')(x)
+    attention_scores = layers.Flatten()(attention_scores)
+    attention_weights = layers.Activation('softmax')(attention_scores)
+    attention_weights = layers.RepeatVector(128)(attention_weights)  # 64*2 from Bidirectional
+    attention_weights = layers.Permute([2, 1])(attention_weights)
     
-    # Apply attention weights
-    x = layers.Multiply()([lstm_out, attention])
-    x = ReduceSumLayer(axis=1)(x)
+    # Apply attention weights to LSTM output
+    weighted_output = layers.Multiply()([lstm_out, attention_weights])
+    x = ReduceSumLayer(axis=1)(weighted_output)
     
     # Dense layers for classification
     x = layers.Dense(128, activation='relu', kernel_regularizer=tf.keras.regularizers.l2(0.01))(x)
