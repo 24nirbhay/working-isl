@@ -1,27 +1,22 @@
-# Core libraries
+# ISL to English Translator - Requirements
+# Indian Sign Language gesture recognition with real-time translation
+# Python 3.10
+
+# Core Data Science & ML
 numpy==1.26.4
 pandas==2.2.3
 scikit-learn==1.5.2
 matplotlib==3.9.3
+joblib==1.4.2
 
-# Deep learning - Use TensorFlow 2.17 which works with protobuf 4.25.3
+# Deep Learning
 tensorflow==2.17.0
 keras==3.5.0
 
-# Computer vision
+# Computer Vision
 opencv-python==4.10.0.84
-
-# Hand tracking and landmark detection
 mediapipe==0.10.20
 
-# Resolve protobuf conflicts — Use 4.25.3 for mediapipe compatibility
+# Protobuf (fixes mediapipe compatibility)
 protobuf==4.25.3
-
-# Utilities
-joblib==1.4.2
-
-# Notes:
-# - TensorFlow 2.17 is used (same package supports GPU when CUDA/cuDNN are installed)
-# - To use GPU on Windows, install the appropriate CUDA and cuDNN versions compatible with TensorFlow 2.17
-#   See: https://www.tensorflow.org/install/source#gpu for compatibility matrix
 
