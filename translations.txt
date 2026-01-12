@@ -28,4 +28,7 @@ good 1 good 1 1 good good 1 1 1 2 2 2 1 1 1 1 1 1 1
 good 1 1 2 beautiful beautiful beautiful beautiful
 good good C good good C C C
 good good L good L L L L L good good good
-
+Z Z Z Z
+B B beautiful R beautiful beautiful
+Q
+B 9 beautiful B G R N N N G N N N G G G G beautiful
