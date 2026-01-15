@@ -33,7 +33,7 @@ else:
     logging.warning("No GPU detected. Training will use CPU.")
 
 
-def train_model(epochs=10, batch_size=8, validation_split=0.2, roots=None):
+def train_model(epochs=12, batch_size=10, validation_split=0.2, roots=None):
     logging.info("Starting model training process...")
     
     # Create timestamped model directory
